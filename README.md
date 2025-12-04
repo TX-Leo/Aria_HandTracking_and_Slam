@@ -1,3 +1,9 @@
+This is a plug-and-play python3 module, which process the hand_tracking and slam data from Meta Aria Gen1 Glasses MPS. 
+
+Hand tracking: visualization of hand keypoints, palm&wrist pose, and semidense point clould. 
+
+Slam: Optimize the human's movement trajectory, phase estimation, and estimation the linear and angular velocity.
+
 # Aria Usage
 About how to use the Meta Aria Gen1 Glasses and MPS to collect data, you should check [README_aria_data_collection](./README_aria_data_collection.md)
 
