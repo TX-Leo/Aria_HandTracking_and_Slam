@@ -24,3 +24,9 @@ bash run_aria.sh
 
 The results are in ```./test_data/mps_TEST_vrs/aria/```
 
+# One Example
+Hand Tracking:
+
+![Door Opening](https://github.com/user-attachments/assets/8572ddb3-c016-4e16-afd3-f2848cb75728)
+
+Slam:
