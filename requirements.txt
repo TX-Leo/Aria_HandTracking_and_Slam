@@ -1,0 +1,8 @@
+numpy
+opencv-python
+scipy
+matplotlib
+tqdm
+open3d
+torch>=2.0,<=2.5
+projectaria_tools==1.7.1
