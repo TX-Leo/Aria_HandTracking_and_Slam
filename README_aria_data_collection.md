@@ -66,18 +66,24 @@ pip install projectaria_tools==1.7.1
 Submit the video for data processing on the MPS server and reorganize the output folder. Job submission may take anywhere from 5 to 30 minutes. For example, if your ```.vrs``` file is ```TEST.vrs```, you would run
 
 ```
-aria_mps single --force -i TEST.vrs -u $ARIA_MPS_UNAME -p $ARIA_MPS_PASSW --features SLAM HAND_TRACKING
-mv TEST.vrs "mps_TEST_vrs/sample.vrs"
-mv TEST.vrs.json "mps_TEST_vrs/else/TEST.vrs.json"
-mv vrs_health_check.json "mps_TEST_vrs/else/vrs_health_check.json"
-mv vrs_health_check_slam.json "mps_TEST_vrs/else/vrs_health_check_slam.json"
+conda activate aria
+cd src/data/
+NAME="open_cabinet_5"
+aria_mps single --force -i "${NAME}.vrs" -u "$ARIA_MPS_UNAME" -p "$ARIA_MPS_PASSW" --features SLAM HAND_TRACKING
+NAME="open_cabinet_5"
+mv "${NAME}.vrs" "mps_${NAME}_vrs/sample.vrs"
+mkdir -p "mps_${NAME}_vrs/else/"
+mv "${NAME}.vrs.json" "mps_${NAME}_vrs/else/sample.vrs.json"
+mv "mps_${NAME}_vrs/vrs_health_check.json" "mps_${NAME}_vrs/else/vrs_health_check.json"
+mv "mps_${NAME}_vrs/vrs_health_check_slam.json" "mps_${NAME}_vrs/else/vrs_health_check_slam.json"
 ```
+
 After this, it should be:
 ```
 - test_data
-    - mps_TEST_vrs/
+    - mps_NAME_vrs/
         - else
-            - TEST.vrs.json
+            - sample.vrs.json
             - vrs_health_check.json
             - vrs_health_check_slam.json
         - hand_tracking
@@ -95,7 +101,7 @@ After this, it should be:
 
 # Visualize the aria sensors
 ```
-viewer_aria_sensors --vrs "./test_data/mps_TEST_vrs/sample.vrs"
+viewer_aria_sensors --vrs "./test_data/mps_NAME_vrs/sample.vrs"
 ```
 
 # Visualize the hand tracking and slam

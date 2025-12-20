@@ -16,12 +16,12 @@ pip install -r requirements.txt
 download devignetting_masks:
 ```
 curl -L -o devignetting_masks.zip "https://www.projectaria.com/async/sample/download/?bucket=core&filename=devignetting_masks_bin.zip"
-unzip -o ./devignetting_masks.zip -d ./devignetting_masks
+unzip -o ./devignetting_masks.zip -d ./aria_devignetting_masks
 rm ./devignetting_masks.zip
 ```
 download a test data:
 ```
-TODO
+TODO Should upload the mps_TEST_vrs to the cloud
 ```
 # Run aria
 ```

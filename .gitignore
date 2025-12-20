@@ -1,6 +1,6 @@
 .DS_Store
 test_data/
-devignetting_masks/
+aria_devignetting_masks/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

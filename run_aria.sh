@@ -1,10 +1,10 @@
-python aria.py --mps_path "./test_data/mps_TEST_vrs/"
+ xvfb-run python aria.py --mps_path "./test_data/mps_open_door_5_vrs/"
 
 # The folder should be like:
 # - test_data
 #     - mps_TEST_vrs/
 #         - else
-#             - TEST.vrs.json
+#             - sample.vrs.json
 #             - vrs_health_check.json
 #             - vrs_health_check_slam.json
 #         - hand_tracking
