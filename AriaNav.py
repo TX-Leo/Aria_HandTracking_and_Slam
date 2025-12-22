@@ -21,6 +21,9 @@ class AriaNav:
     robot_pos_2d: np.ndarray = None # 优化后的机器人 2D 位置
     robot_v: float = 0.0            # 线速度
     robot_w: float = 0.0            # 角速度
+    delta_x: float = 0.0
+    delta_y: float = 0.0
+    delta_theta: float = 0.0
 
 class AriaNavOptimizer:
     def __init__(self, dt: float = 0.1, 

@@ -1,6 +1,7 @@
 .DS_Store
 test_data/
 aria_devignetting_masks/
+git_push.sh
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

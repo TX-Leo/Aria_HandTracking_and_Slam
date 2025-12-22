@@ -9,7 +9,7 @@ import math
 import numpy as np
 from tqdm import tqdm
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from torch.utils.data import Dataset, get_worker_info
 
 # Project Aria Tools 核心依赖库
@@ -29,11 +29,14 @@ from aria.AriaStereo import AriaStereo, AriaStereoGenerator
 # from aria.AriaPhaseSegmenter import AriaPhaseSegmenter
 from aria.AriaPhaseSegmenter_v2 import AriaPhaseSegmenter
 from aria.AriaPointCloud import AriaPointCloudOps          
-from aria.AriaHand import AriaHand, AriaHandOps                      
+from aria.AriaHand import AriaJointAngle, AriaHand, AriaHandOps                      
 
 # -------------------------------------------------------------------------
 # 全局配置参数 (Configuration)
 # -------------------------------------------------------------------------
+# 目标图像尺寸: (宽, 高)
+TARGET_WIDTH = 640
+TARGET_HEIGHT = 640
 
 # Aria 去暗角 mask 文件路径
 DEVIGNETTING_MASKS_PATH = os.path.join(os.path.dirname(__file__), "aria_devignetting_masks")
@@ -207,20 +210,40 @@ class AriaDataset(Dataset):
         robot_vels_np = opt_result['velocities']
 
         # 生成评估报告图表
-        eval_plot_path = os.path.join(self.save_path, "nav_evaluation_report.png")
+        eval_plot_path = os.path.join(self.save_path, "aria_nav_eval.png")
         AriaNavEvaluator.evaluate_and_plot(
             human_traj_np, robot_traj_np, robot_vels_np, 
             eval_plot_path, dt=1.0/self.fps
         )
-
+        
+        # 手动修改robot nav所有结果的符号，让其数值更加易读
+        robot_traj_np = -robot_traj_np  # 修正 x, y, theta
+        robot_vels_np = -robot_vels_np  # 修正 v, w
+        start_pose = robot_traj_np[0] # 获取第一帧作为基准
         # 缓存结果
         for k, ts in enumerate(raw_timestamps):
+            # 计算增量 Delta
+            curr_pose = robot_traj_np[k]
+            # 计算绝对角度 (弧度 -> 度)
+            abs_theta_deg = math.degrees(curr_pose[2])
+
+            # 计算增量角度 (必须在弧度下做归一化，防止 359度到 1度跳变)
+            dt_raw_rad = curr_pose[2] - start_pose[2]
+            dt_norm_rad = math.atan2(math.sin(dt_raw_rad), math.cos(dt_raw_rad))
+            delta_theta_deg = math.degrees(dt_norm_rad)
+
+            dx = curr_pose[0] - start_pose[0]
+            dy = curr_pose[1] - start_pose[1]
+
             nav_obj = AriaNav(
-                agent_pos_3d=raw_pos_3d_list[k],
-                agent_pos_2d=human_traj_np[k],
-                robot_pos_2d=robot_traj_np[k],
-                robot_v=robot_vels_np[k][0],
-                robot_w=robot_vels_np[k][1]
+                agent_pos_3d = raw_pos_3d_list[k],
+                agent_pos_2d = human_traj_np[k],
+                robot_pos_2d = np.array([curr_pose[0], curr_pose[1], abs_theta_deg]),# 存入增量 (单位：m, m, deg)
+                robot_v = robot_vels_np[k][0],
+                robot_w = robot_vels_np[k][1],
+                delta_x = dx,
+                delta_y = dy,
+                delta_theta = delta_theta_deg
             )
             self.nav_data_map[ts] = nav_obj
         print(f"导航轨迹处理完毕。")
@@ -228,17 +251,131 @@ class AriaDataset(Dataset):
     def _save_navigation_trajectory(self):
         """保存导航轨迹为 CSV"""
         if not self.all_aria_structs: return
-        out_csv_path = os.path.join(self.save_path, "nav_trajectory.csv")
+        out_csv_path = os.path.join(self.save_path, "aria_nav_traj.csv")
         rows = []
         for s in self.all_aria_structs:
             x, y, yaw = s.nav.robot_pos_2d
             v, w = s.nav.robot_v, s.nav.robot_w
-            rows.append(f"{s.idx},{s.ts},{x:.6f},{y:.6f},{yaw:.6f},{v:.6f},{w:.6f},{s.phase}")
+            dx, dy, dt = s.nav.delta_x, s.nav.delta_y, s.nav.delta_theta
+            rows.append(f"{s.idx},{s.ts},{x:.6f},{y:.6f},{yaw:.6f},{v:.6f},{w:.6f},"
+                        f"{dx:.6f},{dy:.6f},{dt:.6f},{s.phase}")
+        
         with open(out_csv_path, "w") as f:
-            f.write("idx,timestamp_ns,robot_x,robot_y,robot_yaw,v,w,phase\n")
+            f.write("idx,ts_ns,x_m,y_m,theta_deg,v_ms,w_rs,dx_m,dy_m,dt_deg,phase\n")
             f.write("\n".join(rows))
         print("导航轨迹保存完成。")
 
+    def _draw_trajectory_trail(self, img, current_idx, future_len=60, step=3, ground_offset=1.7):
+        """
+        在图像上渲染“彩虹路径”：透明路面 + 原有的渐变点。
+        """
+        if len(self.trajectory_points_3d) == 0: return img
+        
+        # 1. 环境准备
+        s = self.all_aria_structs[current_idx]
+        K = s.cam.k
+        T_w2c = np.linalg.inv(s.cam.c2w)
+        h_vis, w_vis = img.shape[:2]
+        h_raw, w_raw = w_vis, h_vis 
+
+        # 2. 提取未来轨迹点
+        start_idx = current_idx
+        end_idx = min(len(self.trajectory_points_3d), current_idx + future_len)
+        points_world = self.trajectory_points_3d[start_idx:end_idx:step].copy()
+        if len(points_world) < 2: return img
+        
+        points_world[:, 2] -= ground_offset # 映射到地面
+
+        # 3. 计算路径边界 (Road Geometry)
+        ROAD_WIDTH = 0.35 # 路宽 0.35 米
+        left_edges, right_edges = [], []
+        
+        for i in range(len(points_world)):
+            if i < len(points_world) - 1:
+                direction = points_world[i+1] - points_world[i]
+            else:
+                direction = points_world[i] - points_world[i-1]
+            
+            # 计算法向量
+            norm = np.array([-direction[1], direction[0], 0])
+            norm_len = np.linalg.norm(norm)
+            if norm_len < 1e-6: continue
+            norm = (norm / norm_len) * ROAD_WIDTH
+            
+            left_edges.append(points_world[i] + norm)
+            right_edges.append(points_world[i] - norm)
+
+        # 4. 投影函数
+        def project_pts(pts3d):
+            pts3d = np.array(pts3d)
+            R, t = T_w2c[:3, :3], T_w2c[:3, 3]
+            p_cam = (R @ pts3d.T).T + t
+            mask = p_cam[:, 2] > 0.1 
+            uv_h = (K @ p_cam.T).T
+            z = uv_h[:, 2] + 1e-6
+            u_vis = h_raw - 1 - (uv_h[:, 1] / z)
+            v_vis = uv_h[:, 0] / z
+            return np.stack([u_vis, v_vis], axis=1).astype(np.int32), mask
+
+        l_2d, l_mask = project_pts(left_edges)
+        r_2d, r_mask = project_pts(right_edges)
+        c_2d, c_mask = project_pts(points_world)
+
+        # --- 5. 渲染底层路面 (Road Surface) ---
+        overlay = img.copy()
+        # 建议使用青蓝色作为单色路面背景，科技感强
+        ROAD_BASE_COLOR = (255, 200, 0) # 浅青色
+        
+        num_seg = len(l_2d) - 1
+        for i in range(num_seg):
+            if not (l_mask[i] and l_mask[i+1] and r_mask[i] and r_mask[i+1]): continue
+            
+            # 计算透明度衰减 (让尽头自然隐没)
+            # 0.0 (近处) -> 1.0 (远处)
+            progress = i / num_seg
+            alpha = max(0, 0.4 * (1.0 - progress)) # 近处 0.4 透明度，远处 0
+            
+            poly_pts = np.array([l_2d[i], l_2d[i+1], r_2d[i+1], r_2d[i]], np.int32)
+            
+            # 只有在 alpha > 0 时才画，节省开销并解决远端奇怪的切口
+            if alpha > 0.01:
+                # 绘制分段多边形
+                # 注意：fillPoly 不直接支持 alpha，我们通过叠加实现
+                sub_overlay = img.copy()
+                cv2.fillPoly(sub_overlay, [poly_pts], ROAD_BASE_COLOR, lineType=cv2.LINE_AA)
+                img = cv2.addWeighted(sub_overlay, alpha, img, 1 - alpha, 0)
+                
+                # 绘制边缘细虚线
+                if i % 2 == 0:
+                    cv2.line(img, tuple(l_2d[i]), tuple(l_2d[i+1]), (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.line(img, tuple(r_2d[i]), tuple(r_2d[i+1]), (255, 255, 255), 1, cv2.LINE_AA)
+
+        # --- 6. 渲染顶层原有的渐变点 (Original Dot Logic) ---
+        # 这部分完全保留并优化了你之前的逻辑
+        num_pts = len(c_2d)
+        for i in range(num_pts):
+            if not c_mask[i]: continue
+            
+            pt = tuple(c_2d[i])
+            if not (0 <= pt[0] < w_vis and 0 <= pt[1] < h_vis): continue
+            
+            # [保留逻辑] 颜色计算: Near(Red) -> Far(Blue)
+            progress = i / max(1, num_pts - 1)
+            hue = int(160 * progress) 
+            color_hsv = np.uint8([[[hue, 255, 255]]])
+            color_bgr = cv2.cvtColor(color_hsv, cv2.COLOR_HSV2BGR)[0][0].tolist()
+            
+            # [保留逻辑] 大小渐变: 近大远小
+            radius = int(5 - 2 * progress) 
+            
+            # 画实心点
+            cv2.circle(img, pt, radius, color_bgr, -1, cv2.LINE_AA)
+            # 给远处的点加一点微光，防止太小看不见
+            if i > num_pts * 0.7:
+                cv2.circle(img, pt, radius + 1, (255, 255, 255), 1, cv2.LINE_AA)
+
+        return img
+    
     def _save_struct_to_json(self, s: AriaStruct):
         """保存单帧数据结构为 JSON，并保存图像"""
         frame_dir = os.path.join(self.save_path, "all_data", f"{s.idx:05d}")
@@ -249,41 +386,52 @@ class AriaDataset(Dataset):
         stereo_l_path = None
         stereo_r_path = None
         if s.stereo.valid:
-            stereo_l_path = os.path.join(frame_dir, "stereo_left_rect.png")
-            stereo_r_path = os.path.join(frame_dir, "stereo_right_rect.png")
+            stereo_l_path = os.path.join(frame_dir, "slam_l.png")
+            stereo_r_path = os.path.join(frame_dir, "slam_r.png")
             cv2.imwrite(stereo_l_path, s.stereo.left_img)
             cv2.imwrite(stereo_r_path, s.stereo.right_img)
 
         def safe_list(arr): return arr.tolist() if isinstance(arr, np.ndarray) else arr
 
         data = {
-            "idx": s.idx, "ts": s.ts,
+            "idx": s.idx, 
+            "ts": s.ts,
             "phase": int(s.phase),
             "cam": {
-                "h": s.cam.h, "w": s.cam.w,
-                "k": safe_list(s.cam.k), "d": safe_list(s.cam.d), "c2w": safe_list(s.cam.c2w),
+                "h": s.cam.h, 
+                "w": s.cam.w,
+                "k": safe_list(s.cam.k), 
+                "d": safe_list(s.cam.d), 
+                "c2w": safe_list(s.cam.c2w),
                 "rgb_path": rgb_path
             },
             "stereo": {
                 "valid": s.stereo.valid,
-                "left_path": stereo_l_path,
-                "right_path": stereo_r_path
+                "slam_l_path": stereo_l_path,
+                "slam_r_path": stereo_r_path
             },
-            "rgb_path": rgb_path, "hands": [],
             "nav": {
                 "agent_pos_3d": safe_list(s.nav.agent_pos_3d),
                 "agent_pos_2d": safe_list(s.nav.agent_pos_2d),
                 "robot_pos_2d": safe_list(s.nav.robot_pos_2d),
                 "robot_v": float(s.nav.robot_v),
-                "robot_w": float(s.nav.robot_w)
-            }
+                "robot_w": float(s.nav.robot_w),
+                "delta_x": float(s.nav.delta_x),
+                "delta_y": float(s.nav.delta_y),
+                "delta_theta": float(s.nav.delta_theta)
+            },
+            "hands": []
         }
         for hand in s.hands:
             data["hands"].append({
-                "is_right": hand.is_right, "confidence": hand.confidence,
-                "wrist_pose": safe_list(hand.wrist_pose), "palm_pose": safe_list(hand.palm_pose),
-                "keypoints_3d": safe_list(hand.hand_keypoints_3d), "keypoints_2d": safe_list(hand.hand_keypoints_2d),
-                "grasp_state": hand.grasp_state
+                "is_right": hand.is_right, 
+                "confidence": hand.confidence,
+                "wrist_pose": safe_list(hand.wrist_pose), 
+                "palm_pose": safe_list(hand.palm_pose),
+                "keypoints_3d": safe_list(hand.hand_keypoints_3d), 
+                "keypoints_2d": safe_list(hand.hand_keypoints_2d),
+                "grasp_state": hand.grasp_state,
+                "joint_angles": hand.joint_angles.data if hand.joint_angles else {}
             })
         with open(os.path.join(frame_dir, "data.json"), 'w') as f:
             json.dump(data, f, indent=4)
@@ -296,156 +444,337 @@ class AriaDataset(Dataset):
             img = s.cam.rgb.copy()
             frames_all.append(img)
         video_args = {"fps": self.fps, "audio_path": audio_path if os.path.exists(audio_path) else None}
-        utils_media.create_video_from_frames(frames_all, os.path.join(self.save_path, "video_original.mp4"), **video_args)
+        utils_media.create_video_from_frames(frames_all, os.path.join(self.save_path, "aria_video_orig.mp4"), **video_args)
 
-    def _draw_trajectory_trail(self, img, current_idx, future_len=30, step=5, ground_offset=1.5):
-        """
-        在图像上绘制离散的未来轨迹点 (Waypoints)。
-        
-        Args:
-            img: 当前帧图像
-            current_idx: 当前帧索引
-            future_len: 向未来预测多少帧 (默认30)
-            step: 每隔多少帧画一个点 (默认5)
-            ground_offset: 头部到地面的高度 (米)
-        """
+    def _draw_trajectory_trail(self, img, current_idx, future_len=60, step=3, ground_offset=1.7):
         if len(self.trajectory_points_3d) == 0: return img
         
-        # 1. 获取当前相机参数
+        # 1. 环境准备 (保持不变)
         s = self.all_aria_structs[current_idx]
         K = s.cam.k
-        T_c2w = s.cam.c2w
-        T_w2c = np.linalg.inv(T_c2w) # World -> Camera
-        
+        T_w2c = np.linalg.inv(s.cam.c2w)
         h_vis, w_vis = img.shape[:2]
         h_raw, w_raw = w_vis, h_vis 
 
-        # 2. 确定未来窗口: [current, current + future_len]
+        # 2. 提取并“抽稀”点位
         start_idx = current_idx
         end_idx = min(len(self.trajectory_points_3d), current_idx + future_len)
+        raw_pts = self.trajectory_points_3d[start_idx:end_idx:step].copy()
+        if len(raw_pts) < 2: return img
         
-        if start_idx >= end_idx: return img
+        # --- [关键修改：距离过滤逻辑] ---
+        # 确保用于生成路面的点之间至少有 10cm 的距离，防止抖动和重叠
+        filtered_pts = [raw_pts[0]]
+        for i in range(1, len(raw_pts)):
+            dist = np.linalg.norm(raw_pts[i] - filtered_pts[-1])
+            if dist > 0.10: # 10厘米阈值
+                filtered_pts.append(raw_pts[i])
+        
+        points_world = np.array(filtered_pts)
+        
+        # 如果过滤后点太少，说明位移不足以支撑路面渲染
+        should_draw_road = len(points_world) >= 2
+        # -----------------------------
 
-        # 3. 提取并采样点
-        # 我们取 slice，然后用 [::step] 进行采样
-        # 例如: indices = 0, 5, 10, 15, 20, 25
-        points_world_subset = self.trajectory_points_3d[start_idx:end_idx:step].copy()
-        
-        if len(points_world_subset) == 0: return img
+        points_world[:, 2] -= ground_offset # 映射到地面
 
-        # 4. 映射到地面
-        points_world_subset[:, 2] -= ground_offset
+        # 3. 计算路径边界 (仅在位移足够时执行)
+        left_edges, right_edges = [], []
+        if should_draw_road:
+            ROAD_WIDTH = 0.35 
+            for i in range(len(points_world)):
+                if i < len(points_world) - 1:
+                    direction = points_world[i+1] - points_world[i]
+                else:
+                    direction = points_world[i] - points_world[i-1]
+                
+                norm = np.array([-direction[1], direction[0], 0])
+                norm_len = np.linalg.norm(norm)
+                if norm_len < 1e-6: continue
+                norm = (norm / norm_len) * ROAD_WIDTH
+                left_edges.append(points_world[i] + norm)
+                right_edges.append(points_world[i] - norm)
 
-        # 5. 投影: World -> Camera -> Pixel
-        R = T_w2c[:3, :3]
-        t = T_w2c[:3, 3]
-        points_cam = (R @ points_world_subset.T).T + t
-        
-        # Camera -> Pixel (Raw Landscape)
-        uv_homo = (K @ points_cam.T).T
-        z_safe = uv_homo[:, 2]
-        
-        # 过滤掉相机背后的点
-        valid_mask = z_safe > 0.1
-        if not np.any(valid_mask): return img
-        
-        u_raw = uv_homo[:, 0] / (z_safe + 1e-6)
-        v_raw = uv_homo[:, 1] / (z_safe + 1e-6)
-        
-        # 6. 旋转: Raw -> Vis
-        u_vis = h_raw - 1 - v_raw
-        v_vis = u_raw
-        
-        points_2d = np.stack([u_vis, v_vis], axis=1).astype(np.int32)
-        
-        # 7. 绘制圆点
-        # 使用 HSV 彩虹色：近处(Red/Warm) -> 远处(Blue/Cold)
-        num_pts = len(points_2d)
-        
+        # 4. 投影函数 (定义同前)
+        def project_pts(pts3d):
+            if len(pts3d) == 0: return np.array([]), np.array([])
+            pts3d = np.array(pts3d)
+            R, t = T_w2c[:3, :3], T_w2c[:3, 3]
+            p_cam = (R @ pts3d.T).T + t
+            mask = p_cam[:, 2] > 0.1 
+            uv_h = (K @ p_cam.T).T
+            z = uv_h[:, 2] + 1e-6
+            u_v = h_raw - 1 - (uv_h[:, 1] / z)
+            v_v = uv_h[:, 0] / z
+            return np.stack([u_v, v_v], axis=1).astype(np.int32), mask
+
+        # 5. 渲染底层路面 (仅在位移足够时渲染)
+        if should_draw_road:
+            l_2d, l_mask = project_pts(left_edges)
+            r_2d, r_mask = project_pts(right_edges)
+            ROAD_BASE_COLOR = (255, 200, 0)
+            
+            num_seg = len(l_2d) - 1
+            for i in range(num_seg):
+                if not (l_mask[i] and l_mask[i+1] and r_mask[i] and r_mask[i+1]): continue
+                
+                progress = i / num_seg
+                # 额外的平滑度处理：如果机器人走得很慢，透明度进一步降低
+                speed_factor = min(1.0, np.linalg.norm(points_world[-1] - points_world[0]) / 1.0)
+                alpha = max(0, 0.4 * (1.0 - progress) * speed_factor)
+                
+                if alpha > 0.01:
+                    sub_overlay = img.copy()
+                    poly_pts = np.array([l_2d[i], l_2d[i+1], r_2d[i+1], r_2d[i]], np.int32)
+                    cv2.fillPoly(sub_overlay, [poly_pts], ROAD_BASE_COLOR, lineType=cv2.LINE_AA)
+                    img = cv2.addWeighted(sub_overlay, alpha, img, 1 - alpha, 0)
+
+        # 6. 渲染航向点 (始终渲染原始采样点，确保视觉连贯性)
+        # 重新投影原始采样点
+        c_2d, c_mask = project_pts(raw_pts - np.array([0,0,ground_offset]))
+        num_pts = len(c_2d)
         for i in range(num_pts):
-            if not valid_mask[i]: continue
-            
-            pt = tuple(points_2d[i])
-            
-            # 边界检查
+            if not c_mask[i]: continue
+            pt = tuple(c_2d[i])
             if not (0 <= pt[0] < w_vis and 0 <= pt[1] < h_vis): continue
             
-            # 颜色计算: 0.0 (Near) -> 1.0 (Far)
             progress = i / max(1, num_pts - 1)
-            
-            # Hue: 0(Red) -> 120(Green) -> 160(Blue)
-            # 让人感觉近处是热点(目标)，远处是冷色
             hue = int(160 * progress) 
             color_hsv = np.uint8([[[hue, 255, 255]]])
             color_bgr = cv2.cvtColor(color_hsv, cv2.COLOR_HSV2BGR)[0][0].tolist()
-            
-            # 大小渐变: 近大远小
-            radius = int(10 - 4 * progress) # 10 -> 6
-            
-            # 画实心圆
-            cv2.circle(img, pt, radius, color_bgr, -1)
-            # 画白色轮廓，增加对比度
-            # cv2.circle(img, pt, radius + 1, (255, 255, 255), 2)
+            radius = int(5 - 2 * progress) 
+            cv2.circle(img, pt, radius, color_bgr, -1, cv2.LINE_AA)
 
         return img
     
     def _create_visualization_videos(self, audio_path: str):
-        """生成带骨架、速度、阶段信息的可视化视频"""
+        """生成带精美仪表盘、居中标题和清晰骨架的视频"""
         if not self.all_aria_structs: return
         frames_all = []
-        
-        # For v1:
-        # PHASE_COLORS = { 0: (255, 200, 0), 1: (0, 165, 255), 2: (0, 0, 255), 3: (0, 255, 0) }
-        # PHASE_NAMES = {0: "0:APPROACH", 1: "1:UNLOCK", 2: "2:OPEN", 3: "3:TRAVERSE"}
-        # For v2:
-        PHASE_COLORS = { 0: (0, 255, 0), 1: (0, 0, 255) }
-        PHASE_NAMES = { 0: "0:NAVIGATION", 1: "1:MANIPULATION"}
 
-        for s in tqdm(self.all_aria_structs, desc="渲染视频帧"):
+        # 记录初始位姿用于计算 Delta
+        start_nav = self.all_aria_structs[0].nav.robot_pos_2d # [x0, y0, t0]
+        
+        # 配色与字体设置
+        PHASE_COLORS = { 0: (0, 255, 127), 1: (255, 127, 0) } 
+        PHASE_NAMES = { 0: "NAVIGATION", 1: "MANIPULATION"}
+        TEXT_COLOR = (240, 240, 240)
+        VAL_COLOR = (0, 255, 255) 
+        LABEL_COLOR = (200, 200, 200)
+        DELTA_COLOR = (255, 150, 50)
+        # 使用 DUPLEX 字体看起来更硬朗、更帅
+        FONT = cv2.FONT_HERSHEY_DUPLEX 
+        THICK = 1
+
+        def draw_glass_rect(img, pt1, pt2, alpha=0.5):
+            """绘制更薄、更透明的灰色矩形框"""
+            overlay = img.copy()
+            cv2.rectangle(overlay, pt1, pt2, (25, 25, 25), -1)
+            return cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
+
+        def draw_arc_gauge(img, center, val, max_val, label, color_pos=(0, 255, 127), color_neg=(0, 0, 255)):
+            """ 绘制汽车风格圆弧仪表盘 """
+            cx, cy = center; r = 28
+            # 背景弧
+            cv2.ellipse(img, (cx, cy), (r, r), 0, 135, 405, (60, 60, 60), 4, cv2.LINE_AA)
+            # 根据正负选择颜色
+            color = color_pos if val >= 0 else color_neg
+            # 计算弧度角度 (仪表盘范围 270 度: 从 135度 到 405度)
+            angle = 270 * (abs(val) / max_val)
+            angle = min(angle, 270)
+            cv2.ellipse(img, (cx, cy), (r, r), 0, 135, 135 + int(angle), color, 4, cv2.LINE_AA)
+            # 中间写简称
+            cv2.putText(img, label, (cx-8, cy+5), FONT, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+
+        for s in tqdm(self.all_aria_structs, desc="渲染 UI"):
             img = s.cam.rgb.copy()
 
-            # --- [新增] 绘制地面轨迹 ---
-            # [修改] 绘制未来离散航点
-            # future_len=30 (未来30帧), step=5 (每5帧取一个点), 共画 6 个点
+            # --- 基础 3D 绘制 ---
             img = self._draw_trajectory_trail(img, s.idx, future_len=90, step=3, ground_offset=1.7)
-            # -------------------------
-
             for hand in s.hands:
-                # 调用AriaHandOps 进行绘制
-                img = AriaHandOps.draw_axis(img, hand.palm_pose, s.cam.k, s.cam.d)
+                # img = AriaHandOps.draw_axis(img, hand.palm_pose, s.cam.k, s.cam.d)
+                img = AriaHandOps.draw_axis(img, hand.wrist_pose, s.cam.k, s.cam.d)
                 img = AriaHandOps.draw_skeleton(img, hand)
+
+            # --- UI 布局：顶部 Phase (完全居中) ---
+            phase_name = f"PHASE: {PHASE_NAMES.get(s.phase, 'UNKNOWN')}"
+            p_color = PHASE_COLORS.get(s.phase, (255, 255, 255))
             
-            # 绘制底部黑色信息栏
-            cv2.rectangle(img, (0, 0), (s.cam.w, 200), (0, 0, 0), -1)
+            # 计算文字宽度以实现真正居中
+            (t_w, t_h), _ = cv2.getTextSize(phase_name, FONT, 0.6, 1)
+            center_x = (640 - t_w) // 2
+            # 绘制顶部半透明背景
+            # img = draw_glass_rect(img, (center_x - 20, 10), (center_x + t_w + 20, 45), alpha=0.6)
+            cv2.putText(img, phase_name, (center_x, 30), FONT, 0.6, p_color, 1, cv2.LINE_AA)
+
+            # --- UI 布局：左上角 Nav Panel ---
+            img = draw_glass_rect(img, (10, 40), (240, 360), alpha=0.6)
             
-            # 绘制速度信息
-            cv2.putText(img, f"V: {s.nav.robot_v:.2f} m/s", (20, 40), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.putText(img, f"W: {s.nav.robot_w:.2f} rad/s", (350, 40), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            # 计算增量 Delta
+            dx = s.nav.delta_x
+            dy = s.nav.delta_y
+            dt = s.nav.delta_theta
+
+            # 1. V 仪表盘 (圆弧) + 文字
+            draw_arc_gauge(img, (45, 105), s.nav.robot_v, 1.0, "V")
+            cv2.putText(img, f"LINEAR SPEED", (90, 95), FONT, 0.4, LABEL_COLOR, 1, cv2.LINE_AA)
+            cv2.putText(img, f"{s.nav.robot_v:>5.2f} m/s", (90, 115), FONT, 0.5, VAL_COLOR, 1, cv2.LINE_AA)
+
+            # 2. W 仪表盘 (圆弧) + 文字
+            draw_arc_gauge(img, (45, 175), s.nav.robot_w, 0.75, "W")
+            cv2.putText(img, f"ANGULAR SPEED", (90, 165), FONT, 0.4, LABEL_COLOR, 1, cv2.LINE_AA)
+            cv2.putText(img, f"{s.nav.robot_w:>5.2f} r/s", (90, 185), FONT, 0.5, VAL_COLOR, 1, cv2.LINE_AA)
+
+            # 3. X/Y 坐标 (文字区分 Abs 和 Delta)
+            # 略微放大雷达框到 50x50 像素
+            bx1, by1, bx2, by2 = 20, 220, 70, 270
+            cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
             
-            # 绘制阶段信息
-            phase_id = s.phase
-            phase_name = PHASE_NAMES.get(phase_id, "UNKNOWN")
-            phase_color = PHASE_COLORS.get(phase_id, (255, 255, 255))
-            cv2.putText(img, f"PHASE: {phase_name}", (20, 90), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, phase_color, 3)
+            # 绘制雷达背景框和十字基准线（增加科技感）
+            cv2.rectangle(img, (bx1, by1), (bx2, by2), (80, 80, 80), 1, cv2.LINE_AA)
+            cv2.line(img, (cx, by1), (cx, by2), (50, 50, 50), 1) # 垂直基准线
+            cv2.line(img, (bx1, cy), (bx2, cy), (50, 50, 50), 1) # 水平基准线
+
+            # [关键修改] 提高灵敏度：量程从 5.0m 缩小到 2.0m
+            # 这意味着机器人移动 2 米，点就会到达方框边缘
+            # 你可以根据实际行走范围调整这个值，例如 0.5 (极灵敏) 或 2.0 (适中)
+            SENSITIVITY_RANGE = 2.0
             
-            # 绘制手部状态
-            for hand in s.hands:
-                side = "R" if hand.is_right else "L"
-                state = "CLOSED" if hand.grasp_state == 1 else "OPEN"
-                col = (0, 0, 255) if hand.grasp_state == 1 else (255, 255, 0)
-                x_pos = 350 if hand.is_right else 20
-                cv2.putText(img, f"{side}: {state}", (x_pos, 140), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2)
+            half_width = (bx2 - bx1) // 2
+            # 计算映射像素 (dx 和 dy 使用之前计算好的 Delta)
+            map_px = int(cx + (dx / SENSITIVITY_RANGE) * half_width)
+            map_py = int(cy - (dy / SENSITIVITY_RANGE) * half_width) # 图像 Y 轴向下，所以用减
+
+            # 边缘约束：防止点跑出方框
+            map_px = max(bx1 + 2, min(map_px, bx2 - 2))
+            map_py = max(by1 + 2, min(map_py, by2 - 2))
+            
+            # 绘制当前位置：核心点 + 外圈发光效果
+            cv2.circle(img, (map_px, map_py), 3, VAL_COLOR, -1, cv2.LINE_AA)
+            cv2.circle(img, (map_px, map_py), 5, VAL_COLOR, 1, cv2.LINE_AA) # 外圈发光
+            
+            # 右侧文字信息
+            cv2.putText(img, "POSITION (X, Y)", (90, 230), FONT, 0.4, LABEL_COLOR, 1, cv2.LINE_AA)
+            cv2.putText(img, f"Abs: {s.nav.robot_pos_2d[0]:>5.2f}, {s.nav.robot_pos_2d[1]:>5.2f}m", (90, 250), FONT, 0.4, VAL_COLOR, 1, cv2.LINE_AA)
+            cv2.putText(img, f"Dlt: {dx:>5.2f}, {dy:>5.2f}m", (90, 268), FONT, 0.4, DELTA_COLOR, 1, cv2.LINE_AA)
+
+            # 4. Theta 罗盘仪表盘 + 文字
+            c_cx, c_cy = 45, 315; c_r = 20
+            
+            # [核心修改] 获取已经是度的 Delta Theta
+            dt_deg = s.nav.delta_theta
+            
+            # 绘图逻辑需要弧度：
+            dt_rad = math.radians(dt_deg) 
+            
+            # 绘制背景
+            cv2.circle(img, (c_cx, c_cy), c_r, (80, 80, 80), 1, cv2.LINE_AA)
+            cv2.line(img, (c_cx, c_cy - c_r), (c_cx, c_cy - c_r + 5), (200, 200, 200), 1, cv2.LINE_AA)
+            
+            # 绘制彩色填充弧
+            # color_theta 逻辑
+            color_theta = (0, 255, 127) if dt_deg >= 0 else (200, 0, 255)
+            # cv2.ellipse 的角度参数本来就是 Degree，直接用 dt_deg
+            cv2.ellipse(img, (c_cx, c_cy), (c_r, c_r), 0, -90, -90 + int(dt_deg), color_theta, 2, cv2.LINE_AA)
+
+            # 绘制指针 (这里需要弧度)
+            p_rad = dt_rad - math.pi/2 
+            px = int(c_cx + c_r * math.cos(p_rad))
+            py = int(c_cy + c_r * math.sin(p_rad))
+            cv2.line(img, (c_cx, c_cy), (px, py), color_theta, 2, cv2.LINE_AA)
+            cv2.circle(img, (c_cx, c_cy), 2, (255, 255, 255), -1)
+            
+            # 文字展示 (由于 s.nav.robot_pos_2d[2] 已经是度了，不需要再 math.degrees)
+            cv2.putText(img, "ORIENTATION (T)", (90, 305), FONT, 0.4, LABEL_COLOR, 1, cv2.LINE_AA)
+            cv2.putText(img, f"Abs: {s.nav.robot_pos_2d[2]:>5.1f} deg", (90, 325), FONT, 0.4, VAL_COLOR, 1, cv2.LINE_AA)
+            cv2.putText(img, f"Dlt: {s.nav.delta_theta:>+5.1f} deg", (90, 343), FONT, 0.4, DELTA_COLOR, 1, cv2.LINE_AA)
+
+            # --- UI 布局：底部手部面板 (全状态+数据对齐版) ---
+            l_hand = next((h for h in s.hands if not h.is_right), None)
+            r_hand = next((h for h in s.hands if h.is_right), None)
+            is_blink = (s.idx // 5) % 2 == 0 
+
+            def draw_hand_panel(img, hand, is_right):
+                x = 430 if is_right else 10
+                y = 475 # 稍微调高一点，为多出的行留出空间
+                w, h = 200, 155 # 高度增加到 155
                 
+                # --- 1. 数据对齐映射表 ---
+                mapping = {
+                    "Thu": (["Thumb_CMC_Flex", "Thumb_MCP_Flex", "Thumb_IP_Flex"], "Thumb_CMC_Abd"),
+                    "Ind": (["Index_MCP_Flex", "Index_PIP_Flex", "Index_DIP_Flex"], "Index_MCP_Abd"),
+                    "Mid": (["Middle_MCP_Flex", "Middle_PIP_Flex", "Middle_DIP_Flex"], "Middle_MCP_Abd"),
+                    "Rin": (["Ring_MCP_Flex", "Ring_PIP_Flex", "Ring_DIP_Flex"], "Ring_MCP_Abd"),
+                    "Pin": (["Pinky_MCP_Flex", "Pinky_PIP_Flex", "Pinky_DIP_Flex"], "Pinky_MCP_Abd")
+                }
+
+                # --- 2. 状态逻辑 ---
+                if hand is not None:
+                    is_grasp = (hand.grasp_state == 1)
+                    conf = hand.confidence
+                    state_str = "CLOSED" if is_grasp else "OPEN"
+                    col = (0, 0, 255) if is_grasp else (0, 191, 255)
+                    angle_data = hand.joint_angles.data if hand.joint_angles else {}
+                else:
+                    is_grasp = False; conf = 0.0; state_str = "NOT DETECTED"
+                    col = (120, 120, 120); angle_data = {}
+
+                # --- 3. 绘制底框与特效 ---
+                img = draw_glass_rect(img, (x, y), (x + w, y + h))
+                if is_grasp:
+                    if is_blink:
+                        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2, cv2.LINE_AA)
+                        # [红点移动] 放在左上角空位，避免遮挡
+                        cv2.circle(img, (x + 15, y + 18), 4, (0, 0, 255), -1, cv2.LINE_AA)
+
+                # --- 4. 第一行：标题居中 ---
+                title = f"{'RIGHT' if is_right else 'LEFT'} HAND"
+                (t_w, _), _ = cv2.getTextSize(title, FONT, 0.45, 1)
+                t_x = x + (w - t_w) // 2
+                cv2.putText(img, title, (t_x, y + 25), FONT, 0.45, col, 1, cv2.LINE_AA)
+
+                # --- 5. 第二行：Confidence 和 Status 全称 ---
+                conf_txt = f"CONFIDENCE: {conf:.2f}"
+                stat_txt = f"STATUS: {state_str}"
+                # 较细小的字体展示全称
+                cv2.putText(img, conf_txt, (x + 10, y + 45), FONT, 0.32, (200, 200, 200), 1, cv2.LINE_AA)
+                cv2.putText(img, stat_txt, (x + 105, y + 45), FONT, 0.32, col, 1, cv2.LINE_AA)
+
+                # --- 6. 绘制 5 指动态 Bar ---
+                finger_names = ["Thu", "Ind", "Mid", "Rin", "Pin"]
+                for i, ui_name in enumerate(finger_names):
+                    y_row = y + 65 + i * 18 # 从 y+65 开始绘制 Bar
+                    cv2.putText(img, ui_name, (x + 10, y_row + 8), FONT, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+                    
+                    # 获取角度数据
+                    flex_keys, abd_key = mapping[ui_name]
+                    flex_sum = sum([angle_data.get(k, 0) for k in flex_keys])
+                    abd_val = angle_data.get(abd_key, 0)
+                    
+                    f_col = (0, 0, 255) if is_grasp else (200, 130, 60)
+                    f_w = int(min(flex_sum / 180.0, 1.0) * 125) 
+                    a_w = int(min(abd_val / 45.0, 1.0) * 125)
+                    
+                    # 背景槽
+                    cv2.rectangle(img, (x + 55, y_row + 1), (x + 180, y_row + 4), (50, 50, 50), -1)
+                    cv2.rectangle(img, (x + 55, y_row + 7), (x + 180, y_row + 10), (50, 50, 50), -1)
+                    
+                    # 填充 Bar
+                    if f_w > 0:
+                        cv2.rectangle(img, (x + 55, y_row + 1), (x + 55 + f_w, y_row + 4), f_col, -1, cv2.LINE_AA)
+                    if a_w > 0:
+                        cv2.rectangle(img, (x + 55, y_row + 7), (x + 55 + a_w, y_row + 10), (100, 200, 255), -1, cv2.LINE_AA)
+                return img
+
+            # --- 每一帧都绘制面板 (不管手在不在) ---
+            img = draw_hand_panel(img, l_hand, False)
+            img = draw_hand_panel(img, r_hand, True)
+
             frames_all.append(img)
             
         video_args = {"fps": self.fps, "audio_path": audio_path if os.path.exists(audio_path) else None}
-        utils_media.create_video_from_frames(frames_all, os.path.join(self.save_path, "video_all.mp4"), **video_args)
+        utils_media.create_video_from_frames(frames_all, os.path.join(self.save_path, "aria_video_vis.mp4"), **video_args)
 
-   
     def __len__(self) -> int:
         return self.num_frames
 
@@ -498,16 +827,31 @@ class AriaDataset(Dataset):
         h_orig, w_orig = rgb_img.shape[:2]
         rgb_img = np.rot90(rgb_img, k=-1)
         rgb_img = np.ascontiguousarray(rgb_img)
-        h, w = rgb_img.shape[:2]
+
+        # --- [新增修改：缩放图像] ---
+        h_after_rot, w_after_rot = rgb_img.shape[:2]
+        scale_w = TARGET_WIDTH / w_after_rot
+        scale_h = TARGET_HEIGHT / h_after_rot
+        rgb_img = cv2.resize(rgb_img, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
+
+        h, w = TARGET_HEIGHT, TARGET_WIDTH # 更新为新尺寸 # h, w = rgb_img.shape[:2]
 
         # 5. 构建 AriaCam 对象
         fx, fy = rgb_linear_calib.get_focal_lengths()
         cx, cy = rgb_linear_calib.get_principal_point()
-        k_matrix = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+
+        # [注意] 原代码中旋转后的 K 矩阵对应关系可能需要根据旋转逻辑调整
+        # 这里为了配合缩放，对内参进行等比缩放
+        # 由于 Aria 原始是 1408x1408 左右，旋转后 w/h 互换，这里应用计算出的缩放比例
+        k_matrix = np.array([
+            [fx * scale_w, 0,            cx * scale_w], 
+            [0,            fy * scale_h, cy * scale_h], 
+            [0,            0,            1           ]
+        ])
+
         # 注意: 这里的 Pose 是 T_device_world，而 Cam 需要 c2w
         # 但通常 device_calib 中有 T_device_camera，需要组合
         # 这里简化处理，直接使用 rgb_pose (设备 Pose)
-        
         aria_cam = AriaCam(rgb=rgb_img, h=h, w=w, k=k_matrix, d=np.zeros(5), c2w=rgb_pose)
         T_camera_to_device = rgb_calib.get_transform_device_camera().inverse().to_matrix()
         
@@ -523,16 +867,15 @@ class AriaDataset(Dataset):
         # 7. 处理手部数据 (使用AriaHandOps 类静态方法)
         hands_result = self.hand_tracking_results[idx]
         aria_hands = []
-
         # 处理左手
         left_hand =AriaHandOps.process_single_hand(
-            hands_result.left_hand, T_camera_to_device, k_matrix, h_orig, w_orig, False
+            hands_result.left_hand, T_camera_to_device, k_matrix, h, w, False
         )
         if left_hand: aria_hands.append(left_hand)
 
         # 处理右手
         right_hand =AriaHandOps.process_single_hand(
-            hands_result.right_hand, T_camera_to_device, k_matrix, h_orig, w_orig, True
+            hands_result.right_hand, T_camera_to_device, k_matrix, h, w, True
         )
         if right_hand: aria_hands.append(right_hand)
 
@@ -554,17 +897,17 @@ class AriaDataset(Dataset):
         # 保存融合点云 (环境 + 轨迹)
         AriaPointCloudOps.save_merged_point_cloud(
             self.point_cloud, self.trajectory_points_3d,
-            os.path.join(self.save_path, "pc_scene_and_head_traj.ply")
+            os.path.join(self.save_path, "aria_pc_scene_and_head_traj.ply")
         )
         # 仅保存环境点云
         AriaPointCloudOps.save_point_cloud_ply(
-            self.point_cloud, os.path.join(self.save_path, "pc_scene.ply")
+            self.point_cloud, os.path.join(self.save_path, "aria_pc_scene.ply")
         )
         # 可视化 (可选，默认注释掉以支持 Headless 模式)
         # AriaPointCloudOps.visualize_scene_with_trajectory(self.point_cloud, self.trajectory_points_3d)
         
         # [Step 3] 提取原始音频
-        audio_path = os.path.join(self.save_path, "original_audio.wav")
+        audio_path = os.path.join(self.save_path, "aria_audio_orig.wav")
         extract_audio_track(self.vrs_path, audio_path)
 
         print("开始处理所有 Aria 帧...")
