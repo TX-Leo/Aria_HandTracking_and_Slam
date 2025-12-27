@@ -16,3 +16,7 @@ class AriaCam:
     k: np.ndarray = None    # 内参矩阵 (3, 3)
     d: np.ndarray = None    # 畸变系数
     c2w: np.ndarray = None  # 相机到世界的变换矩阵 (4, 4) Pose
+    c2d: np.ndarray = None  # 相机到device的变换矩阵 (4, 4) Pose
+    d2w: np.ndarray = None  # device到世界的变换矩阵 (4, 4) Pose
+    
+    # c2w=d2w@c2d

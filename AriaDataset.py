@@ -184,18 +184,11 @@ class AriaDataset(Dataset):
 
         for i in range(start_idx, end_idx):
             ts = self.rgb_timestamps_ns[i]
-            # 获取矫正后的时间戳和 Pose
             corrected_ts = self.mps_data_provider.get_rgb_corrected_timestamp_ns(ts, TimeQueryOptions.CLOSEST)
-            pose_obj = self.mps_data_provider.get_closed_loop_pose(corrected_ts, TimeQueryOptions.CLOSEST)
-            
-            if hasattr(pose_obj, "transform_world_device"):
-                matrix = pose_obj.transform_world_device.to_matrix()
-            else:
-                matrix = pose_obj.to_matrix()
-            
-            pos_3d = matrix[:3, 3]
+            T_d2w = self.mps_data_provider.get_closed_loop_pose(corrected_ts, TimeQueryOptions.CLOSEST).transform_world_device.to_matrix()
+            pos_3d = T_d2w[:3, 3]
             raw_pos_3d_list.append(pos_3d)
-            yaw = self._rotation_matrix_to_yaw(matrix[:3, :3])
+            yaw = self._rotation_matrix_to_yaw(T_d2w[:3, :3])
             pose_2d = np.array([pos_3d[0], pos_3d[1], yaw])
             raw_timestamps.append(corrected_ts)
             raw_poses_2d.append(pose_2d)
@@ -265,117 +258,6 @@ class AriaDataset(Dataset):
             f.write("\n".join(rows))
         print("导航轨迹保存完成。")
 
-    def _draw_trajectory_trail(self, img, current_idx, future_len=60, step=3, ground_offset=1.7):
-        """
-        在图像上渲染“彩虹路径”：透明路面 + 原有的渐变点。
-        """
-        if len(self.trajectory_points_3d) == 0: return img
-        
-        # 1. 环境准备
-        s = self.all_aria_structs[current_idx]
-        K = s.cam.k
-        T_w2c = np.linalg.inv(s.cam.c2w)
-        h_vis, w_vis = img.shape[:2]
-        h_raw, w_raw = w_vis, h_vis 
-
-        # 2. 提取未来轨迹点
-        start_idx = current_idx
-        end_idx = min(len(self.trajectory_points_3d), current_idx + future_len)
-        points_world = self.trajectory_points_3d[start_idx:end_idx:step].copy()
-        if len(points_world) < 2: return img
-        
-        points_world[:, 2] -= ground_offset # 映射到地面
-
-        # 3. 计算路径边界 (Road Geometry)
-        ROAD_WIDTH = 0.35 # 路宽 0.35 米
-        left_edges, right_edges = [], []
-        
-        for i in range(len(points_world)):
-            if i < len(points_world) - 1:
-                direction = points_world[i+1] - points_world[i]
-            else:
-                direction = points_world[i] - points_world[i-1]
-            
-            # 计算法向量
-            norm = np.array([-direction[1], direction[0], 0])
-            norm_len = np.linalg.norm(norm)
-            if norm_len < 1e-6: continue
-            norm = (norm / norm_len) * ROAD_WIDTH
-            
-            left_edges.append(points_world[i] + norm)
-            right_edges.append(points_world[i] - norm)
-
-        # 4. 投影函数
-        def project_pts(pts3d):
-            pts3d = np.array(pts3d)
-            R, t = T_w2c[:3, :3], T_w2c[:3, 3]
-            p_cam = (R @ pts3d.T).T + t
-            mask = p_cam[:, 2] > 0.1 
-            uv_h = (K @ p_cam.T).T
-            z = uv_h[:, 2] + 1e-6
-            u_vis = h_raw - 1 - (uv_h[:, 1] / z)
-            v_vis = uv_h[:, 0] / z
-            return np.stack([u_vis, v_vis], axis=1).astype(np.int32), mask
-
-        l_2d, l_mask = project_pts(left_edges)
-        r_2d, r_mask = project_pts(right_edges)
-        c_2d, c_mask = project_pts(points_world)
-
-        # --- 5. 渲染底层路面 (Road Surface) ---
-        overlay = img.copy()
-        # 建议使用青蓝色作为单色路面背景，科技感强
-        ROAD_BASE_COLOR = (255, 200, 0) # 浅青色
-        
-        num_seg = len(l_2d) - 1
-        for i in range(num_seg):
-            if not (l_mask[i] and l_mask[i+1] and r_mask[i] and r_mask[i+1]): continue
-            
-            # 计算透明度衰减 (让尽头自然隐没)
-            # 0.0 (近处) -> 1.0 (远处)
-            progress = i / num_seg
-            alpha = max(0, 0.4 * (1.0 - progress)) # 近处 0.4 透明度，远处 0
-            
-            poly_pts = np.array([l_2d[i], l_2d[i+1], r_2d[i+1], r_2d[i]], np.int32)
-            
-            # 只有在 alpha > 0 时才画，节省开销并解决远端奇怪的切口
-            if alpha > 0.01:
-                # 绘制分段多边形
-                # 注意：fillPoly 不直接支持 alpha，我们通过叠加实现
-                sub_overlay = img.copy()
-                cv2.fillPoly(sub_overlay, [poly_pts], ROAD_BASE_COLOR, lineType=cv2.LINE_AA)
-                img = cv2.addWeighted(sub_overlay, alpha, img, 1 - alpha, 0)
-                
-                # 绘制边缘细虚线
-                if i % 2 == 0:
-                    cv2.line(img, tuple(l_2d[i]), tuple(l_2d[i+1]), (255, 255, 255), 1, cv2.LINE_AA)
-                    cv2.line(img, tuple(r_2d[i]), tuple(r_2d[i+1]), (255, 255, 255), 1, cv2.LINE_AA)
-
-        # --- 6. 渲染顶层原有的渐变点 (Original Dot Logic) ---
-        # 这部分完全保留并优化了你之前的逻辑
-        num_pts = len(c_2d)
-        for i in range(num_pts):
-            if not c_mask[i]: continue
-            
-            pt = tuple(c_2d[i])
-            if not (0 <= pt[0] < w_vis and 0 <= pt[1] < h_vis): continue
-            
-            # [保留逻辑] 颜色计算: Near(Red) -> Far(Blue)
-            progress = i / max(1, num_pts - 1)
-            hue = int(160 * progress) 
-            color_hsv = np.uint8([[[hue, 255, 255]]])
-            color_bgr = cv2.cvtColor(color_hsv, cv2.COLOR_HSV2BGR)[0][0].tolist()
-            
-            # [保留逻辑] 大小渐变: 近大远小
-            radius = int(5 - 2 * progress) 
-            
-            # 画实心点
-            cv2.circle(img, pt, radius, color_bgr, -1, cv2.LINE_AA)
-            # 给远处的点加一点微光，防止太小看不见
-            if i > num_pts * 0.7:
-                cv2.circle(img, pt, radius + 1, (255, 255, 255), 1, cv2.LINE_AA)
-
-        return img
-    
     def _save_struct_to_json(self, s: AriaStruct):
         """保存单帧数据结构为 JSON，并保存图像"""
         frame_dir = os.path.join(self.save_path, "all_data", f"{s.idx:05d}")
@@ -403,6 +285,8 @@ class AriaDataset(Dataset):
                 "k": safe_list(s.cam.k), 
                 "d": safe_list(s.cam.d), 
                 "c2w": safe_list(s.cam.c2w),
+                "c2d": safe_list(s.cam.c2d),
+                "d2w": safe_list(s.cam.d2w),
                 "rgb_path": rgb_path
             },
             "stereo": {
@@ -452,7 +336,7 @@ class AriaDataset(Dataset):
         # 1. 环境准备 (保持不变)
         s = self.all_aria_structs[current_idx]
         K = s.cam.k
-        T_w2c = np.linalg.inv(s.cam.c2w)
+        T_w2c = np.linalg.inv(s.cam.c2w) 
         h_vis, w_vis = img.shape[:2]
         h_raw, w_raw = w_vis, h_vis 
 
@@ -501,12 +385,15 @@ class AriaDataset(Dataset):
             pts3d = np.array(pts3d)
             R, t = T_w2c[:3, :3], T_w2c[:3, 3]
             p_cam = (R @ pts3d.T).T + t
+            
             mask = p_cam[:, 2] > 0.1 
+            # 使用已经修正过的 K 进行投影
             uv_h = (K @ p_cam.T).T
             z = uv_h[:, 2] + 1e-6
-            u_v = h_raw - 1 - (uv_h[:, 1] / z)
-            v_v = uv_h[:, 0] / z
-            return np.stack([u_v, v_v], axis=1).astype(np.int32), mask
+            u_final = uv_h[:, 0] / z
+            v_final = uv_h[:, 1] / z
+            
+            return np.stack([u_final, v_final], axis=1).astype(np.int32), mask
 
         # 5. 渲染底层路面 (仅在位移足够时渲染)
         if should_draw_road:
@@ -795,17 +682,14 @@ class AriaDataset(Dataset):
         rgb_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
 
         # 2. 获取 Pose 和 Calibration
-        rgb_pose = np.eye(4)
+        T_world_device = np.eye(4)
         aria_nav = AriaNav(np.zeros(3), np.zeros(3), np.zeros(3), 0.0, 0.0)
 
         if self.has_online_calibration:
             corrected_ts = mps_dp.get_rgb_corrected_timestamp_ns(capture_timestamp_ns, TimeQueryOptions.CLOSEST)
-            rgb_pose_obj = mps_dp.get_rgb_corrected_closed_loop_pose(corrected_ts, TimeQueryOptions.CLOSEST)
-            if hasattr(rgb_pose_obj, "transform_world_device"):
-                rgb_pose = rgb_pose_obj.transform_world_device.to_matrix()
-            else:
-                rgb_pose = rgb_pose_obj.to_matrix()
-
+            T_world_device = mps_dp.get_closed_loop_pose(corrected_ts, TimeQueryOptions.CLOSEST).transform_world_device.to_matrix()
+            # these two lines are equal to： T_world_device = mps_dp.get_rgb_corrected_closed_loop_pose(capture_timestamp_ns, TimeQueryOptions.CLOSEST).transform_world_device.to_matrix()
+           
             if corrected_ts in self.nav_data_map:
                 aria_nav = self.nav_data_map[corrected_ts]
             
@@ -822,38 +706,73 @@ class AriaDataset(Dataset):
         rgb_img = calibration.devignetting(rgb_img, self.devignetting_mask).astype(np.uint8)
         rgb_img = calibration.distort_by_calibration(rgb_img, rgb_linear_calib, rgb_calib, InterpolationMethod.BILINEAR)
         
-        # 4. 图像旋转 (Landscape -> Portrait)
-        # RGB 顺时针旋转 90 度 (k=-1)
+        # 4. 获取原始内参（landscape）
+        fx_orig, fy_orig = rgb_linear_calib.get_focal_lengths()
+        cx_orig, cy_orig = rgb_linear_calib.get_principal_point()
         h_orig, w_orig = rgb_img.shape[:2]
+
+        # 5. 图像旋转 (Landscape -> Portrait)
+        # RGB 顺时针旋转 90 度 (k=-1) 之后需要修改两个东西：K和c2w
         rgb_img = np.rot90(rgb_img, k=-1)
         rgb_img = np.ascontiguousarray(rgb_img)
 
-        # --- [新增修改：缩放图像] ---
-        h_after_rot, w_after_rot = rgb_img.shape[:2]
-        scale_w = TARGET_WIDTH / w_after_rot
-        scale_h = TARGET_HEIGHT / h_after_rot
+        # # 6. 计算旋转 90 度(顺时针)后的内参
+        # # 旋转后：新轴 x = 旧轴 (h - 1 - y), 新轴 y = 旧轴 x
+        fx_rot, fy_rot = fy_orig, fx_orig
+        cx_rot = h_orig - 1 - cy_orig
+        cy_rot = cx_orig
+
+        # @@@@@@@@@DEBUG@@@@@@@@@
+        # fx_rot, fy_rot = fx_orig, fy_orig
+        # cx_rot = cx_orig
+        # cy_rot = cy_orig
+        # @@@@@@@@@@@@@@@@@@
+
+        # 7. 缩放图像
         rgb_img = cv2.resize(rgb_img, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
 
-        h, w = TARGET_HEIGHT, TARGET_WIDTH # 更新为新尺寸 # h, w = rgb_img.shape[:2]
+        # 8. 计算缩放参数
+        # 旋转后 w = h_orig_land, h = w_orig_land
+        scale_w = TARGET_WIDTH / h_orig
+        scale_h = TARGET_HEIGHT / w_orig
 
-        # 5. 构建 AriaCam 对象
-        fx, fy = rgb_linear_calib.get_focal_lengths()
-        cx, cy = rgb_linear_calib.get_principal_point()
+        # 9. 最后的h和w
+        h, w = TARGET_HEIGHT, TARGET_WIDTH
+        
+        # 最后的fx,fy,cx,cy
+        fx = fx_rot*scale_w
+        fy = fy_rot*scale_h
+        cx = cx_rot*scale_w
+        cy = cy_rot*scale_h
 
-        # [注意] 原代码中旋转后的 K 矩阵对应关系可能需要根据旋转逻辑调整
-        # 这里为了配合缩放，对内参进行等比缩放
-        # 由于 Aria 原始是 1408x1408 左右，旋转后 w/h 互换，这里应用计算出的缩放比例
+        # 10. 最后的K (after rot and scale)
         k_matrix = np.array([
-            [fx * scale_w, 0,            cx * scale_w], 
-            [0,            fy * scale_h, cy * scale_h], 
-            [0,            0,            1           ]
+            [fx,           0,            cx         ], 
+            [0,            fy,           cy         ], 
+            [0,            0,            1          ]
         ])
 
-        # 注意: 这里的 Pose 是 T_device_world，而 Cam 需要 c2w
-        # 但通常 device_calib 中有 T_device_camera，需要组合
-        # 这里简化处理，直接使用 rgb_pose (设备 Pose)
-        aria_cam = AriaCam(rgb=rgb_img, h=h, w=w, k=k_matrix, d=np.zeros(5), c2w=rgb_pose)
-        T_camera_to_device = rgb_calib.get_transform_device_camera().inverse().to_matrix()
+        # 11. 计算T_world_camera
+        # 公式：T_world_camera = T_world_device * T_device_camera
+        T_device_camera = rgb_calib.get_transform_device_camera().to_matrix()
+        
+        # 定义绕 Z 轴顺时针旋转 90 度的旋转矩阵 R_z
+        # theta = -90 度 (-pi/2 弧度)
+        # R = [[cos(theta), -sin(theta), 0],
+        #      [sin(theta),  cos(theta), 0],
+        #      [0,           0,          1]]
+        
+        R_z_90 = np.array([
+            [0, 1,  0,  0],
+            [-1,  0,  0,  0],
+            [0,  0,  1,  0],
+            [0,  0,  0,  1]
+        ])
+        T_device_camera_rotated = T_device_camera @ R_z_90
+
+        T_world_camera = T_world_device @ T_device_camera_rotated
+
+        aria_cam = AriaCam(rgb=rgb_img, h=h, w=w, k=k_matrix, d=np.zeros(5), c2w=T_world_camera, c2d=T_device_camera_rotated, d2w=T_world_device)
         
         # 6. 获取校正后的立体图像 (Stereo)
         # Generator 会自动处理尺寸匹配和旋转
@@ -869,13 +788,13 @@ class AriaDataset(Dataset):
         aria_hands = []
         # 处理左手
         left_hand =AriaHandOps.process_single_hand(
-            hands_result.left_hand, T_camera_to_device, k_matrix, h, w, False
+            hands_result.left_hand, np.linalg.inv(T_device_camera_rotated), k_matrix, h, w, False
         )
         if left_hand: aria_hands.append(left_hand)
 
         # 处理右手
         right_hand =AriaHandOps.process_single_hand(
-            hands_result.right_hand, T_camera_to_device, k_matrix, h, w, True
+            hands_result.right_hand, np.linalg.inv(T_device_camera_rotated), k_matrix, h, w, True
         )
         if right_hand: aria_hands.append(right_hand)
 
@@ -889,9 +808,19 @@ class AriaDataset(Dataset):
         执行完整的数据处理流水线并保存所有结果。
         包含：导航优化、点云融合、视频生成、阶段分割、数据导出。
         """
-        # [Step 1] 计算导航轨迹
-        if self.has_online_calibration and not self.nav_data_map:
+
+        print("开始处理所有 Aria 帧...")
+    
+        # 1. 【修复】：先计算全局导航轨迹，填充 nav_data_map
+        if self.has_online_calibration:
             self._process_full_navigation_trajectory()
+        else:
+            print("警告: 缺失在线标定数据，导航可视化将保持为零。")
+
+        # 2. 现在再读取数据，__getitem__ 就能正确找到 nav_data_map 里的值了
+        temp_structs = []
+        for i in tqdm(range(len(self)), desc="读取并处理数据帧"):
+            temp_structs.append(self[i])
 
         # [Step 2] 保存点云数据 (调用 AriaPointCloudOps)
         # 保存融合点云 (环境 + 轨迹)
@@ -909,12 +838,6 @@ class AriaDataset(Dataset):
         # [Step 3] 提取原始音频
         audio_path = os.path.join(self.save_path, "aria_audio_orig.wav")
         extract_audio_track(self.vrs_path, audio_path)
-
-        print("开始处理所有 Aria 帧...")
-        temp_structs = []
-        # 遍历所有帧，触发 __getitem__ 处理
-        for i in tqdm(range(len(self)), desc="读取原始数据"):
-            temp_structs.append(self[i])
             
         # [Step 4] 自动阶段分割
         print("正在进行自动阶段分割 (Auto Phase Segmentation)...")
@@ -931,3 +854,5 @@ class AriaDataset(Dataset):
         self._create_visualization_videos(audio_path)
         
         print("所有任务完成！")
+
+        

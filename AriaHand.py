@@ -165,10 +165,6 @@ class AriaHandOps:
         """计算手腕和手掌的 6D Pose 矩阵"""
         if np.linalg.norm(wrist_n) == 0 or np.linalg.norm(palm_n) == 0: return None, None
         
-        # OpenCV 坐标系修正 (y down, z forward)
-        T_opencv_to_aria = np.eye(4)
-        T_opencv_to_aria[:3, :3] = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]])
-
         palm_wrist_vec = palm_p - wrist_p
         palm_wrist_vec /= (np.linalg.norm(palm_wrist_vec) + 1e-6)
         wrist_n = wrist_n / (np.linalg.norm(wrist_n) + 1e-6)
@@ -190,7 +186,7 @@ class AriaHandOps:
         wrist_mat = build_rotation_matrix(wrist_p, wrist_n, palm_wrist_vec)
         
         # 变换到相机坐标系
-        return T_opencv_to_aria @ T_cam_dev @ palm_mat, T_opencv_to_aria @ T_cam_dev @ wrist_mat
+        return  T_cam_dev @ palm_mat, T_cam_dev @ wrist_mat
 
     @staticmethod
     def _transform_keypoints_to_camera(hand, T_cam_dev):
@@ -202,31 +198,24 @@ class AriaHandOps:
         return kpts_cam
 
     @staticmethod
-    def _project_points_rotated(points_cam, k, h_orig, w_orig):
+    def _project_points_rotated(points_cam, k, h_target, w_target):
         """
-        将 3D 相机坐标投影到 2D 像素坐标，并处理图像旋转 (90度)。
-        输入: points_cam (N, 3), K (3, 3), h_orig (Landscape Height), w_orig (Landscape Width)
-        输出: projected (N, 2), valid_mask (N,)
+        标准投影函数。由于内参 K 已经包含了旋转和缩放，这里直接投影即可。
         """
         z = points_cam[:, 2]
         valid_mask = z > 1e-3
         if not np.any(valid_mask):
             return np.zeros((len(points_cam), 2)), np.zeros(len(points_cam), dtype=bool)
 
+        # 标准内参投影公式: uv = K * [X, Y, Z]^T / Z
         homo_pix = (k @ points_cam.T).T
-        u = homo_pix[:, 0] / homo_pix[:, 2]
-        v = homo_pix[:, 1] / homo_pix[:, 2]
+        u = homo_pix[:, 0] / (homo_pix[:, 2] + 1e-6)
+        v = homo_pix[:, 1] / (homo_pix[:, 2] + 1e-6)
         
-        # 旋转 90 度顺时针的坐标变换公式
-        # new_u = h - 1 - v
-        # new_v = u
-        u_new = h_orig - 1 - v
-        v_new = u
-        projected = np.stack((u_new, v_new), axis=-1)
+        projected = np.stack((u, v), axis=-1)
         
-        # 旋转后的宽高互换
-        h_new, w_new = w_orig, h_orig
-        in_bounds = (0 <= u_new) & (u_new < h_new) & (0 <= v_new) & (v_new < w_new)
+        # 边界检查 (此时 h_target, w_target 已经是 640 了)
+        in_bounds = (0 <= u) & (u < w_target) & (0 <= v) & (v < h_target)
         return projected, valid_mask & in_bounds
     
     @staticmethod
@@ -371,3 +360,5 @@ class AriaHandOps:
         # 混合透明层 (令基盘和激光有虚幻感)
         return cv2.addWeighted(overlay, 0.7, img, 0.3, 0)
     
+
+
