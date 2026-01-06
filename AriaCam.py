@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 from decimal import Decimal, ROUND_HALF_UP
 import argparse
+import subprocess
 
 from projectaria_tools.core import calibration, data_provider, mps
 from projectaria_tools.core.data_provider import VrsDataProvider
@@ -21,7 +22,6 @@ from utils.utils_media import create_video_from_frames
 
 TARGET_WIDTH = 640
 TARGET_HEIGHT = 640
-DEVIGNETTING_MASKS_PATH = os.path.join(os.path.dirname(__file__), "aria_devignetting_masks")
 
 @dataclass
 class AriaCamData:
@@ -118,10 +118,10 @@ class AriaCamGenerator():
         self.mps_provider = mps_provider
         self.device_calib = self.vrs_provider.get_device_calibration()
         self.rgb_stream_id = self.vrs_provider.get_stream_id_from_label("camera-rgb")
-        self.device_calib.set_devignetting_mask_folder_path(DEVIGNETTING_MASKS_PATH)
+        self.device_calib.set_devignetting_mask_folder_path(self._get_devignetting_mask_folder_path())
         self.devignetting_mask = self.device_calib.load_devignetting_mask("camera-rgb")
         self.rgb_calib_ref = self.device_calib.get_camera_calib("camera-rgb")
-
+    
     def get_aria_cam(self, start_idx: int, end_idx: int) -> Optional[AriaCam]:
         aria_cam = AriaCam()
         for idx in tqdm(range(start_idx, end_idx + 1), desc="Processing Aria Cam"):
@@ -136,6 +136,21 @@ class AriaCamGenerator():
         aria_cam.first_ts = aria_cam.cam[0].ts
         aria_cam.mps_path = self.mps_path
         return aria_cam
+    
+    def _get_devignetting_mask_folder_path(self) -> str:
+        devignetting_mask_folder_path = os.path.join(os.path.dirname(__file__), "aria_devignetting_masks")
+        if not os.path.exists(devignetting_mask_folder_path):
+            print(f"Directory {devignetting_mask_folder_path} not found. Downloading devignetting masks...")
+            try:
+                download_cmd = 'curl -L -o devignetting_masks.zip "https://www.projectaria.com/async/sample/download/?bucket=core&filename=devignetting_masks_bin.zip"'
+                subprocess.run(download_cmd, shell=True, check=True)
+                unzip_cmd = f'unzip -o ./devignetting_masks.zip -d {devignetting_mask_folder_path}'
+                subprocess.run(unzip_cmd, shell=True, check=True)
+                os.remove("./devignetting_masks.zip")
+                print("Successfully downloaded and extracted devignetting masks.")
+            except Exception as e:
+                print(f"Error downloading masks: {e}")
+        return devignetting_mask_folder_path
     
     def _calculate_fps(self, tss: List[int]) -> int:
         if len(tss) < 2:
@@ -277,4 +292,4 @@ if __name__ == "__main__":
 
 # conda activate aria
 # cd src
-# python -m aria.AriaCam --mps_path "./data/mps_open_cabinet_5_vrs/"
+# python -m aria.AriaCam --mps_path "./data/open_cabinet_0/mps_open_cabinet_0_005_vrs/"

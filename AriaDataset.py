@@ -108,25 +108,29 @@ class AriaDataset(Dataset):
         aria_phases = aria_phases_generator.get_aria_phases()
         return aria_phases
     
-    def process_all(self):
+    def process_and_save_all(self):
         os.makedirs(os.path.join(self.mps_path, "aria"), exist_ok=True)
         self.tss, self.aria_cam = self._process_aria_cam()
-        self.aria_stereo = self._process_aria_stereo()
-        self.aria_hands = self._process_aria_hand()
-        self.aria_nav_human = self._process_aria_nav_human()
-        self.aria_nav_robot = self._process_aria_nav_robot()
-        self.aria_point_cloud = self._process_aria_point_cloud()
-        self.aria_phases = self._process_aria_phases()
-    
-    def save_all(self):
         self.aria_cam.save_aria_cam_json()
         self.aria_cam.save_aria_cam_video_orig()
+
+        self.aria_stereo = self._process_aria_stereo()
         self.aria_stereo.save_aria_stereo_json()
         self.aria_stereo.save_aria_stereo_video_orig()
+
+        self.aria_hands = self._process_aria_hand()
         self.aria_hands.save_aria_hands_json()
+
+        self.aria_nav_human = self._process_aria_nav_human()
         self.aria_nav_human.save_aria_nav_human_json()
+
+        self.aria_nav_robot = self._process_aria_nav_robot()
         self.aria_nav_robot.save_aria_nav_robot_json()
+
+        self.aria_point_cloud = self._process_aria_point_cloud()
         self.aria_point_cloud.save_all_pc()
+
+        self.aria_phases = self._process_aria_phases()
         self.aria_phases.save_aria_phases_json()
 
     def visualize_all(self):
@@ -157,8 +161,7 @@ class AriaDataset(Dataset):
             fps=self.aria_cam.fps)
         
     def run(self):
-        self.process_all()
-        self.save_all()
+        self.process_and_save_all()
         self.visualize_all()
 
 
@@ -173,4 +176,4 @@ if __name__ == "__main__":
 
 # conda activate aria
 # cd src
-# python -m aria.AriaDataset --mps_path "./data/mps_open_cabinet_5_vrs/" --run_aug
+# python -m aria.AriaDataset --mps_path "./data/open_cabinet_0/mps_open_cabinet_0_005_vrs/" 
