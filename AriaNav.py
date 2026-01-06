@@ -153,3 +153,4 @@ class AriaNavEvaluator:
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
         plt.close()
+    
